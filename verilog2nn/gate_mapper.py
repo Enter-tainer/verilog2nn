@@ -1,18 +1,19 @@
-"""Map gate-level circuits to PyTorch neural networks.
+"""Map gate-level circuits to PyTorch neural networks (pure MLP architecture).
 
 Gate mapping (inputs are {0,1}):
-    NOT(x)   = 1 - x                     (linear)
-    AND(a,b) = ReLU(a+b-1)               (since a+b <= 2, ReLU(a+b-2)=0 always)
-    OR(a,b)  = (a+b) - ReLU(a+b-1)       (ReLU + linear)
-    XOR(a,b) = (a+b) - 2*ReLU(a+b-1)     (ReLU + linear)
+    NOT(x)   = 1 - x                     (linear, no ReLU needed)
+    AND(a,b) = ReLU(a+b-1)               (pre: a+b-1, post: take relu output)
+    OR(a,b)  = (a+b) - ReLU(a+b-1)       (pre: a+b-1, post: (a+b) - relu)
+    XOR(a,b) = (a+b) - 2*ReLU(a+b-1)     (pre: a+b-1, post: (a+b) - 2*relu)
 
-Each topological layer becomes a SparseGateLayer that:
-1. Gathers input values from the state vector
-2. Computes gate outputs (NOT/AND/OR/XOR) vectorized by type
-3. Scatters results back to the state vector
+Each topological layer becomes a GateBlock with two nn.Linear layers:
+    Linear_pre:  state_size -> n_relu   (computes a+b-1 for AND/OR/XOR gates)
+    ReLU
+    Linear_post: (state_size + n_relu) -> n_gates  (combines state & relu outputs)
 
-The model stacks layers with nn.Sequential for a clean PyTorch interface.
-Weights are stored in sparse COO format via safetensors.
+NOT gates are purely linear and handled in the post layer only.
+The model stacks GateBlocks for a clean standard MLP-like interface.
+Weights are stored as dense matrices via safetensors.
 """
 
 import textwrap
@@ -23,24 +24,13 @@ from safetensors.torch import save_file
 
 from verilog2nn.netlist_parser import Circuit, Gate
 
-# Gate type encoding
-TYPE_MAP = {"NOT": 0, "AND": 1, "OR": 2, "XOR": 3}
-
 
 def compile_to_nn(
     circuit: Circuit,
     layers: list[list[Gate]],
     output_dir: Path,
 ) -> None:
-    """Compile circuit to PyTorch NN, saving model code + weights + inference script.
-
-    The network architecture:
-    - Input: binary vector of size num_inputs
-    - For each gate layer: SparseGateLayer (gather -> gate ops -> scatter)
-    - Output: binary vector of size num_outputs
-
-    Net tracking: We maintain a mapping from net_id -> index in state vector.
-    """
+    """Compile circuit to PyTorch NN, saving model code + weights + inference script."""
     num_inputs = len(circuit.input_bits)
     num_outputs = len(circuit.output_bits)
 
@@ -85,10 +75,7 @@ def compile_to_nn(
     save_file(weights, output_dir / "weights.safetensors")
 
     # Generate model.py
-    model_code = _generate_model_code(
-        num_inputs, num_outputs,
-        weights["network_meta"][2].item(),
-    )
+    model_code = _generate_model_code()
     (output_dir / "model.py").write_text(model_code)
 
     # Generate inference.py
@@ -107,31 +94,89 @@ def _compile_layers(
     num_inputs: int,
     num_outputs: int,
 ) -> dict:
-    """Compile all layers to sparse COO format.
+    """Compile all layers to dense W_pre/b_pre/W_post/b_post per layer.
 
-    Per-gate descriptors:
-    - gate_type: 0=NOT, 1=AND, 2=OR, 3=XOR
-    - input indices (up to 2)
-    - output index in state vector
+    For each topological layer:
+    - Separate gates into relu_gates (AND/OR/XOR) and not_gates (NOT)
+    - Build W_pre (state_size x n_relu): gathers a+b for relu gates, bias=-1
+    - Build W_post ((state_size + n_relu) x n_gates): combines state+relu -> output
     """
-    gate_types = []
-    gate_inp0 = []
-    gate_inp1 = []
-    gate_out = []
-    layer_sizes = []
+    weights: dict = {}
+    state_size = current_size
 
-    for layer_gates in layers:
-        layer_sizes.append(len(layer_gates))
-        for gate in layer_gates:
-            gate_types.append(TYPE_MAP[gate.gate_type])
-            gate_inp0.append(net_to_idx[gate.input_nets[0]])
-            if len(gate.input_nets) > 1:
-                gate_inp1.append(net_to_idx[gate.input_nets[1]])
-            else:
-                gate_inp1.append(0)  # unused for NOT
-            net_to_idx[gate.output_net] = current_size
-            gate_out.append(current_size)
-            current_size += 1
+    for layer_idx, layer_gates in enumerate(layers):
+        relu_gates = [g for g in layer_gates if g.gate_type != "NOT"]
+        not_gates = [g for g in layer_gates if g.gate_type == "NOT"]
+        n_relu = len(relu_gates)
+        n_gates = len(layer_gates)
+
+        # --- W_pre: state_size -> n_relu ---
+        # For each relu gate: output = a + b (then bias = -1, then ReLU)
+        W_pre = torch.zeros(n_relu, state_size, dtype=torch.float64)
+        b_pre = torch.full((n_relu,), -1.0, dtype=torch.float64)
+
+        for j, gate in enumerate(relu_gates):
+            idx_a = net_to_idx[gate.input_nets[0]]
+            idx_b = net_to_idx[gate.input_nets[1]]
+            W_pre[j, idx_a] = 1.0
+            W_pre[j, idx_b] = 1.0
+
+        # --- W_post: (state_size + n_relu) -> n_gates ---
+        # Input to post layer is [state; relu_output]
+        post_in_size = state_size + n_relu
+        W_post = torch.zeros(n_gates, post_in_size, dtype=torch.float64)
+        b_post = torch.zeros(n_gates, dtype=torch.float64)
+
+        # We need a consistent ordering: all gates in layer_gates order
+        # Build a mapping from gate -> output index in this layer
+        # relu_idx tracks which relu output corresponds to which relu gate
+        relu_idx_map = {}
+        for j, gate in enumerate(relu_gates):
+            relu_idx_map[id(gate)] = j
+
+        for out_j, gate in enumerate(layer_gates):
+            if gate.gate_type == "NOT":
+                # NOT(x) = 1 - x
+                idx_x = net_to_idx[gate.input_nets[0]]
+                W_post[out_j, idx_x] = -1.0  # -x from state
+                b_post[out_j] = 1.0  # + 1
+            elif gate.gate_type == "AND":
+                # AND(a,b) = ReLU(a+b-1)
+                # post: just take the relu output directly
+                relu_j = relu_idx_map[id(gate)]
+                W_post[out_j, state_size + relu_j] = 1.0
+            elif gate.gate_type == "OR":
+                # OR(a,b) = (a+b) - ReLU(a+b-1)
+                # post: state[a] + state[b] - relu[j]
+                idx_a = net_to_idx[gate.input_nets[0]]
+                idx_b = net_to_idx[gate.input_nets[1]]
+                W_post[out_j, idx_a] = 1.0
+                W_post[out_j, idx_b] = 1.0
+                relu_j = relu_idx_map[id(gate)]
+                W_post[out_j, state_size + relu_j] = -1.0
+            elif gate.gate_type == "XOR":
+                # XOR(a,b) = (a+b) - 2*ReLU(a+b-1)
+                # post: state[a] + state[b] - 2*relu[j]
+                idx_a = net_to_idx[gate.input_nets[0]]
+                idx_b = net_to_idx[gate.input_nets[1]]
+                W_post[out_j, idx_a] = 1.0
+                W_post[out_j, idx_b] = 1.0
+                relu_j = relu_idx_map[id(gate)]
+                W_post[out_j, state_size + relu_j] = -2.0
+
+        weights[f"layer{layer_idx}.W_pre"] = W_pre
+        weights[f"layer{layer_idx}.b_pre"] = b_pre
+        weights[f"layer{layer_idx}.W_post"] = W_post
+        weights[f"layer{layer_idx}.b_post"] = b_post
+
+        # Assign output indices for this layer's gates
+        # In forward: new_state = cat(state, gate_out)
+        # So gate_out[j] is at index state_size + j in the new state
+        for out_j, gate in enumerate(layer_gates):
+            net_to_idx[gate.output_net] = state_size + out_j
+
+        # Next layer's state_size = current + n_gates (relu is transient)
+        state_size = state_size + n_gates
 
     output_indices = []
     for bit in circuit.output_bits:
@@ -140,102 +185,69 @@ def _compile_layers(
         else:
             raise ValueError(f"Output net {bit} not found in net mapping")
 
-    return {
-        "gate_types": torch.tensor(gate_types, dtype=torch.int64),
-        "gate_inp0": torch.tensor(gate_inp0, dtype=torch.int64),
-        "gate_inp1": torch.tensor(gate_inp1, dtype=torch.int64),
-        "gate_out": torch.tensor(gate_out, dtype=torch.int64),
-        "layer_sizes": torch.tensor(layer_sizes, dtype=torch.int64),
-        "network_meta": torch.tensor(
-            [num_inputs, num_outputs, len(layers), current_size],
-            dtype=torch.int64,
-        ),
-        "_output_indices": output_indices,
-    }
+    weights["network_meta"] = torch.tensor(
+        [num_inputs, num_outputs, len(layers), current_size],
+        dtype=torch.int64,
+    )
+    weights["_output_indices"] = output_indices
+
+    return weights
 
 
-def _generate_model_code(
-    num_inputs: int,
-    num_outputs: int,
-    num_layers: int,
-) -> str:
-    """Generate PyTorch nn.Module code for the compiled network."""
+def _generate_model_code() -> str:
+    """Generate PyTorch nn.Module code for the compiled network (pure MLP)."""
     return textwrap.dedent('''\
-        """Auto-generated PyTorch model for verilog2nn compiled circuit."""
+        """Auto-generated PyTorch model for verilog2nn compiled circuit.
+
+        Architecture: pure MLP (nn.Linear + nn.ReLU) stacked in GateBlocks.
+        """
 
         import torch
         import torch.nn as nn
         from safetensors.torch import load_file
 
 
-        class SparseGateLayer(nn.Module):
-            """A single layer of logic gates evaluated via sparse gather/scatter.
+        class GateBlock(nn.Module):
+            """A single topological layer of logic gates as Linear+ReLU+Linear.
 
-            Each layer gathers input values from the state vector, computes
-            gate outputs (NOT/AND/OR/XOR) vectorized by type, and scatters
-            results back to the state vector.
+            Forward:
+                relu_in = Linear_pre(state)      # state_size -> n_relu
+                relu_out = ReLU(relu_in)
+                combined = cat(state, relu_out)   # state_size + n_relu
+                gate_out = Linear_post(combined)  # -> n_gates
+                new_state = cat(state, gate_out)   # state_size + n_gates
             """
 
-            def __init__(
-                self,
-                gate_types: torch.Tensor,
-                gate_inp0: torch.Tensor,
-                gate_inp1: torch.Tensor,
-                gate_out: torch.Tensor,
-            ):
+            def __init__(self, W_pre, b_pre, W_post, b_post, state_size, n_relu):
                 super().__init__()
-                self.register_buffer("gate_types", gate_types)
-                self.register_buffer("gate_inp0", gate_inp0)
-                self.register_buffer("gate_inp1", gate_inp1)
-                self.register_buffer("gate_out", gate_out)
+                self.state_size = state_size
+                self.n_relu = n_relu
 
-            def forward(self, state: torch.Tensor) -> torch.Tensor:
-                """Apply gate operations and update state in-place.
-
-                Args:
-                    state: (batch, total_state_size) tensor
-
-                Returns:
-                    Updated state tensor.
-                """
-                a = state[:, self.gate_inp0]
-                b = state[:, self.gate_inp1]
-
-                n = self.gate_types.shape[0]
-                result = torch.zeros(
-                    state.shape[0], n,
-                    dtype=state.dtype, device=state.device,
+                self.linear_pre = nn.Linear(state_size, n_relu, dtype=torch.float64)
+                self.relu = nn.ReLU()
+                n_gates = W_post.shape[0]
+                self.linear_post = nn.Linear(
+                    state_size + n_relu, n_gates, dtype=torch.float64,
                 )
 
-                not_m = self.gate_types == 0
-                and_m = self.gate_types == 1
-                or_m = self.gate_types == 2
-                xor_m = self.gate_types == 3
+                with torch.no_grad():
+                    self.linear_pre.weight.copy_(W_pre)
+                    self.linear_pre.bias.copy_(b_pre)
+                    self.linear_post.weight.copy_(W_post)
+                    self.linear_post.bias.copy_(b_post)
 
-                if not_m.any():
-                    result[:, not_m] = 1.0 - a[:, not_m]
-                if and_m.any():
-                    result[:, and_m] = torch.relu(
-                        a[:, and_m] + b[:, and_m] - 1.0
-                    )
-                if or_m.any():
-                    ab = a[:, or_m] + b[:, or_m]
-                    result[:, or_m] = ab - torch.relu(ab - 1.0)
-                if xor_m.any():
-                    ab = a[:, xor_m] + b[:, xor_m]
-                    result[:, xor_m] = ab - 2.0 * torch.relu(ab - 1.0)
-
-                state = state.clone()
-                state[:, self.gate_out] = result
-                return state
+            def forward(self, state):
+                relu_out = self.relu(self.linear_pre(state))
+                combined = torch.cat([state, relu_out], dim=-1)
+                gate_out = self.linear_post(combined)
+                return torch.cat([state, gate_out], dim=-1)
 
 
         class VerilogNN(nn.Module):
             """Neural network equivalent of a Verilog combinational circuit.
 
-            Architecture:
-                Input -> [SparseGateLayer x N] -> Output
-                Stacked via nn.Sequential.
+            Architecture: Input -> [GateBlock x N] -> Output
+            Each GateBlock is Linear -> ReLU -> Linear (standard MLP pattern).
             """
 
             def __init__(self, weights_path: str):
@@ -245,8 +257,8 @@ def _generate_model_code(
                 meta = data["network_meta"]
                 self.num_inputs = meta[0].item()
                 self.num_outputs = meta[1].item()
-                self.num_layers = meta[2].item()
-                self.total_state_size = meta[3].item()
+                num_layers = meta[2].item()
+                self.init_state_size = meta[3].item()
 
                 self.register_buffer(
                     "output_indices", data["output_indices"].long()
@@ -261,25 +273,20 @@ def _generate_model_code(
                         "const_indices", data["const_indices"].long()
                     )
 
-                # Build layer stack from sparse gate descriptors
-                gate_types = data["gate_types"].long()
-                gate_inp0 = data["gate_inp0"].long()
-                gate_inp1 = data["gate_inp1"].long()
-                gate_out = data["gate_out"].long()
-                layer_sizes = data["layer_sizes"].long().tolist()
-
-                gate_layers = []
-                offset = 0
-                for size in layer_sizes:
-                    gate_layers.append(SparseGateLayer(
-                        gate_types=gate_types[offset:offset + size],
-                        gate_inp0=gate_inp0[offset:offset + size],
-                        gate_inp1=gate_inp1[offset:offset + size],
-                        gate_out=gate_out[offset:offset + size],
-                    ))
-                    offset += size
-
-                self.gate_layers = nn.Sequential(*gate_layers)
+                blocks = []
+                state_size = self.init_state_size
+                for i in range(num_layers):
+                    W_pre = data[f"layer{i}.W_pre"]
+                    b_pre = data[f"layer{i}.b_pre"]
+                    W_post = data[f"layer{i}.W_post"]
+                    b_post = data[f"layer{i}.b_post"]
+                    n_relu = W_pre.shape[0]
+                    blocks.append(
+                        GateBlock(W_pre, b_pre, W_post, b_post, state_size, n_relu)
+                    )
+                    n_gates = W_post.shape[0]
+                    state_size += n_gates
+                self.blocks = nn.ModuleList(blocks)
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
                 """Forward pass. x shape: (batch, num_inputs), values in {0, 1}.
@@ -289,7 +296,7 @@ def _generate_model_code(
                 x = x.double()
                 batch = x.shape[0]
                 state = torch.zeros(
-                    batch, self.total_state_size,
+                    batch, self.init_state_size,
                     dtype=torch.float64, device=x.device,
                 )
                 state[:, :self.num_inputs] = x
@@ -297,7 +304,8 @@ def _generate_model_code(
                 if self.has_consts:
                     state[:, self.const_indices] = self.const_values
 
-                state = self.gate_layers(state)
+                for block in self.blocks:
+                    state = block(state)
 
                 out = state[:, self.output_indices]
                 return out.round().long()
