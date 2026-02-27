@@ -8,7 +8,7 @@ class Gate:
     """A single logic gate in the netlist."""
 
     name: str
-    gate_type: str  # AND, OR, XOR, NOT
+    gate_type: str  # AND, NOT
     input_nets: list[int]  # net IDs for inputs
     output_net: int  # net ID for output
 
@@ -131,8 +131,6 @@ def parse_netlist(netlist_json: dict, top: str | None = None) -> Circuit:
     gates = []
     gate_type_map = {
         "$_AND_": "AND",
-        "$_OR_": "OR",
-        "$_XOR_": "XOR",
         "$_NOT_": "NOT",
     }
 
@@ -147,7 +145,7 @@ def parse_netlist(netlist_json: dict, top: str | None = None) -> Circuit:
             raise ValueError(
                 f"Unsupported cell type: {cell_type}. "
                 f"Expected one of {list(gate_type_map)}. "
-                f"Make sure Yosys maps to AND/OR/XOR/NOT gates only."
+                f"Make sure Yosys maps to AND/NOT gates only (abc -g AND)."
             )
 
         gate_type = gate_type_map[cell_type]
