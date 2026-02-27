@@ -95,6 +95,7 @@ def test_phase4_safetensors(verbose=False):
         # Check files exist
         assert (output_dir / "weights.safetensors").exists()
         assert (output_dir / "model.py").exists()
+        assert (output_dir / "sparse_linear.py").exists()
         assert (output_dir / "inference.py").exists()
 
         # Load and verify weights
@@ -108,9 +109,10 @@ def test_phase4_safetensors(verbose=False):
 
         # Load model and do a basic forward pass
         sys.path.insert(0, str(output_dir))
-        # Need to reload model module since we might have loaded it before
-        if "model" in sys.modules:
-            del sys.modules["model"]
+        # Need to reload model modules since we might have loaded them before
+        for mod_name in ["model", "sparse_linear"]:
+            if mod_name in sys.modules:
+                del sys.modules[mod_name]
         from model import VerilogNN
         model = VerilogNN(str(output_dir / "weights.safetensors"))
         model.eval()

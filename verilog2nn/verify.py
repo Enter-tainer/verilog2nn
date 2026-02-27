@@ -318,8 +318,9 @@ def verify(
 
     # Load NN model (force reload to handle multiple calls in same process)
     sys.path.insert(0, str(output_dir))
-    if "model" in sys.modules:
-        del sys.modules["model"]
+    for mod_name in ["model", "sparse_linear"]:
+        if mod_name in sys.modules:
+            del sys.modules[mod_name]
     import model as model_mod
     importlib.reload(model_mod)
     model = model_mod.VerilogNN(str(output_dir / "weights.safetensors"))

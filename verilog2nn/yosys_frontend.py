@@ -65,7 +65,7 @@ def synthesize(verilog_path: Path, top: str | None = None) -> dict:
             script_lines.append("synth -flatten")
         script_lines.extend(
             [
-                "abc -g AND,OR,XOR",
+                "abc -g AND",
                 "clean -purge",
                 f"write_json {_quote_yosys_arg(json_path)}",
             ]
