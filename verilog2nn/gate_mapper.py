@@ -11,6 +11,10 @@ Each topological layer is compiled to a pair of linear transforms:
 2. Post-ReLU linear: combines ReLU outputs with direct outputs
 
 Wire routing between layers is handled implicitly through the weight matrices.
+
+For large circuits (>1000 gates), sparse COO format is used to avoid
+creating huge dense matrices. The model uses indexed gather/scatter
+operations for efficient inference.
 """
 
 import textwrap
@@ -20,6 +24,9 @@ import torch
 from safetensors.torch import save_file
 
 from verilog2nn.netlist_parser import Circuit, Gate
+
+# Threshold for switching to sparse representation
+SPARSE_THRESHOLD = 1000
 
 
 def compile_to_nn(
@@ -39,6 +46,8 @@ def compile_to_nn(
     """
     num_inputs = len(circuit.input_bits)
     num_outputs = len(circuit.output_bits)
+    total_gates = len(circuit.gates)
+    use_sparse = total_gates > SPARSE_THRESHOLD
 
     # Assign indices: net_id -> index in current state vector
     # Start with primary inputs
@@ -59,27 +68,74 @@ def compile_to_nn(
         const_values.append(float(val))
         const_indices.append(net_to_idx[net_id])
 
-    # Build layer weights
-    # For each layer, we produce matrices for a 2-step computation:
-    #   h = W_pre @ state + b_pre   (pre-activation)
-    #   r = ReLU(h)                  (activation)
-    #   new_nets = W_post @ [state; r] + b_post  (post-activation, produces gate outputs)
-    # Then state gets updated: pass-through old nets + new gate outputs
+    if use_sparse:
+        weights = _compile_sparse(
+            circuit, layers, net_to_idx, current_size,
+            num_inputs, num_outputs,
+        )
+    else:
+        weights = _compile_dense(
+            circuit, layers, net_to_idx, current_size,
+            num_inputs, num_outputs,
+        )
 
+    # Common metadata
+    weights["output_indices"] = torch.tensor(
+        weights.pop("_output_indices"), dtype=torch.int64,
+    )
+    weights["const_values"] = torch.tensor(
+        const_values if const_values else [0.0], dtype=torch.float64,
+    )
+    weights["const_indices"] = torch.tensor(
+        const_indices if const_indices else [0], dtype=torch.int64,
+    )
+    if const_values:
+        weights["has_consts"] = torch.tensor([1], dtype=torch.int64)
+    else:
+        weights["has_consts"] = torch.tensor([0], dtype=torch.int64)
+
+    # Sparse flag
+    weights["is_sparse"] = torch.tensor(
+        [1 if use_sparse else 0], dtype=torch.int64,
+    )
+
+    save_file(weights, output_dir / "weights.safetensors")
+
+    # Generate model.py
+    model_code = _generate_model_code(
+        num_inputs, num_outputs,
+        weights["network_meta"][2].item(),
+        len(circuit.const_nets) > 0,
+    )
+    (output_dir / "model.py").write_text(model_code)
+
+    # Generate inference.py
+    inference_code = _generate_inference_code(
+        num_inputs, num_outputs,
+        circuit.input_names, circuit.output_names,
+    )
+    (output_dir / "inference.py").write_text(inference_code)
+
+
+def _compile_dense(
+    circuit: Circuit,
+    layers: list[list[Gate]],
+    net_to_idx: dict[int, int],
+    current_size: int,
+    num_inputs: int,
+    num_outputs: int,
+) -> dict:
+    """Original dense matrix compilation for small circuits."""
     layer_params = []
 
     for layer_gates in layers:
         n_gates = len(layer_gates)
         state_size = current_size
 
-        # Each gate that needs ReLU produces one pre-activation value
-        # NOT gates don't need ReLU
         relu_gates = [g for g in layer_gates if g.gate_type != "NOT"]
         not_gates = [g for g in layer_gates if g.gate_type == "NOT"]
         n_relu = len(relu_gates)
 
-        # Pre-activation: compute a+b-1 for each ReLU gate
-        # Shape: (n_relu, state_size), bias: (n_relu,)
         W_pre = torch.zeros(n_relu, state_size, dtype=torch.float64)
         b_pre = torch.zeros(n_relu, dtype=torch.float64)
 
@@ -87,52 +143,38 @@ def compile_to_nn(
             for inp_net in gate.input_nets:
                 idx = net_to_idx[inp_net]
                 W_pre[i, idx] = 1.0
-            b_pre[i] = -1.0  # a+b-1
+            b_pre[i] = -1.0
 
-        # Post-activation: combine state and ReLU outputs to produce gate outputs
-        # Input to post: [state (state_size), relu_outputs (n_relu)]
-        # Output: gate output values for each gate in this layer
         post_input_size = state_size + n_relu
         W_post = torch.zeros(n_gates, post_input_size, dtype=torch.float64)
         b_post = torch.zeros(n_gates, dtype=torch.float64)
 
         gate_output_start = current_size
 
-        # Process NOT gates (linear only, no ReLU needed)
         for gi, gate in enumerate(not_gates):
-            out_idx = gi  # position within this layer's output
             inp_net = gate.input_nets[0]
             inp_idx = net_to_idx[inp_net]
-            # NOT(x) = 1 - x
-            W_post[gi, inp_idx] = -1.0  # -x from state
-            b_post[gi] = 1.0  # +1
+            W_post[gi, inp_idx] = -1.0
+            b_post[gi] = 1.0
 
-        # Process ReLU gates
         not_count = len(not_gates)
         for ri, gate in enumerate(relu_gates):
-            gi = not_count + ri  # position within this layer's output
-            relu_idx = state_size + ri  # position in post input (after state)
+            gi = not_count + ri
+            relu_idx = state_size + ri
 
             if gate.gate_type == "AND":
-                # AND(a,b) = ReLU(a+b-1)
-                # (since a+b <= 2, ReLU(a+b-2) = 0 always when inputs are binary)
-                W_post[gi, relu_idx] = 1.0  # +ReLU(a+b-1)
-
+                W_post[gi, relu_idx] = 1.0
             elif gate.gate_type == "OR":
-                # OR(a,b) = (a+b) - ReLU(a+b-1)
                 for inp_net in gate.input_nets:
                     inp_idx = net_to_idx[inp_net]
-                    W_post[gi, inp_idx] = 1.0  # +a, +b from state
-                W_post[gi, relu_idx] = -1.0  # -ReLU(a+b-1)
-
+                    W_post[gi, inp_idx] = 1.0
+                W_post[gi, relu_idx] = -1.0
             elif gate.gate_type == "XOR":
-                # XOR(a,b) = (a+b) - 2*ReLU(a+b-1)
                 for inp_net in gate.input_nets:
                     inp_idx = net_to_idx[inp_net]
-                    W_post[gi, inp_idx] = 1.0  # +a, +b from state
-                W_post[gi, relu_idx] = -2.0  # -2*ReLU(a+b-1)
+                    W_post[gi, inp_idx] = 1.0
+                W_post[gi, relu_idx] = -2.0
 
-        # Assign net indices for gate outputs
         all_gates_ordered = not_gates + relu_gates
         for gi, gate in enumerate(all_gates_ordered):
             net_to_idx[gate.output_net] = current_size
@@ -149,7 +191,6 @@ def compile_to_nn(
             "gate_output_start": gate_output_start,
         })
 
-    # Build output extraction indices
     output_indices = []
     for bit in circuit.output_bits:
         if bit in net_to_idx:
@@ -157,7 +198,6 @@ def compile_to_nn(
         else:
             raise ValueError(f"Output net {bit} not found in net mapping")
 
-    # Save weights
     weights = {}
     for i, lp in enumerate(layer_params):
         weights[f"layer_{i}_W_pre"] = lp["W_pre"]
@@ -165,16 +205,6 @@ def compile_to_nn(
         weights[f"layer_{i}_W_post"] = lp["W_post"]
         weights[f"layer_{i}_b_post"] = lp["b_post"]
 
-    # Save metadata as 1D tensors
-    weights["output_indices"] = torch.tensor(output_indices, dtype=torch.int64)
-    weights["const_values"] = torch.tensor(
-        const_values if const_values else [0.0], dtype=torch.float64
-    )
-    weights["const_indices"] = torch.tensor(
-        const_indices if const_indices else [0], dtype=torch.int64
-    )
-
-    # Metadata for reconstruction
     meta_list = []
     for lp in layer_params:
         meta_list.extend([
@@ -188,27 +218,75 @@ def compile_to_nn(
         [num_inputs, num_outputs, len(layer_params), current_size],
         dtype=torch.int64,
     )
-    if const_values:
-        weights["has_consts"] = torch.tensor([1], dtype=torch.int64)
-    else:
-        weights["has_consts"] = torch.tensor([0], dtype=torch.int64)
+    weights["_output_indices"] = output_indices
+    return weights
 
-    save_file(weights, output_dir / "weights.safetensors")
 
-    # Generate model.py
-    model_code = _generate_model_code(
-        num_inputs, num_outputs, len(layer_params), len(circuit.const_nets) > 0
-    )
-    (output_dir / "model.py").write_text(model_code)
+def _compile_sparse(
+    circuit: Circuit,
+    layers: list[list[Gate]],
+    net_to_idx: dict[int, int],
+    current_size: int,
+    num_inputs: int,
+    num_outputs: int,
+) -> dict:
+    """Sparse compilation for large circuits.
 
-    # Generate inference.py
-    inference_code = _generate_inference_code(
-        num_inputs,
-        num_outputs,
-        circuit.input_names,
-        circuit.output_names,
-    )
-    (output_dir / "inference.py").write_text(inference_code)
+    Instead of dense matrices, stores per-gate operation descriptors:
+    - gate_type: 0=NOT, 1=AND, 2=OR, 3=XOR
+    - input indices (up to 2)
+    - output index in state vector
+
+    The model evaluates gates directly using gather/scatter.
+    """
+    # Gate type encoding
+    TYPE_MAP = {"NOT": 0, "AND": 1, "OR": 2, "XOR": 3}
+
+    # Flatten all gates in topological order, recording per-gate info
+    gate_types = []   # int per gate
+    gate_inp0 = []    # first input index
+    gate_inp1 = []    # second input index (0 for NOT, unused)
+    gate_out = []     # output index in state vector
+
+    # Also track layer boundaries for batched evaluation
+    layer_sizes = []
+
+    for layer_gates in layers:
+        layer_sizes.append(len(layer_gates))
+        for gate in layer_gates:
+            gate_types.append(TYPE_MAP[gate.gate_type])
+            gate_inp0.append(net_to_idx[gate.input_nets[0]])
+            if len(gate.input_nets) > 1:
+                gate_inp1.append(net_to_idx[gate.input_nets[1]])
+            else:
+                gate_inp1.append(0)  # unused for NOT
+            # Assign output index
+            net_to_idx[gate.output_net] = current_size
+            gate_out.append(current_size)
+            current_size += 1
+
+    output_indices = []
+    for bit in circuit.output_bits:
+        if bit in net_to_idx:
+            output_indices.append(net_to_idx[bit])
+        else:
+            raise ValueError(f"Output net {bit} not found in net mapping")
+
+    weights = {
+        "gate_types": torch.tensor(gate_types, dtype=torch.int64),
+        "gate_inp0": torch.tensor(gate_inp0, dtype=torch.int64),
+        "gate_inp1": torch.tensor(gate_inp1, dtype=torch.int64),
+        "gate_out": torch.tensor(gate_out, dtype=torch.int64),
+        "layer_sizes": torch.tensor(layer_sizes, dtype=torch.int64),
+        "network_meta": torch.tensor(
+            [num_inputs, num_outputs, len(layers), current_size],
+            dtype=torch.int64,
+        ),
+        # Unused but kept for API compatibility
+        "layer_meta": torch.tensor([0], dtype=torch.int64),
+        "_output_indices": output_indices,
+    }
+    return weights
 
 
 def _generate_model_code(
@@ -241,11 +319,38 @@ def _generate_model_code(
 
                 self.output_indices = data["output_indices"].long()
                 self.has_consts = data["has_consts"][0].item() == 1
+                self.is_sparse = data.get("is_sparse", torch.tensor([0]))[0].item() == 1
 
                 if self.has_consts:
                     self.const_values = data["const_values"].double()
                     self.const_indices = data["const_indices"].long()
 
+                if self.is_sparse:
+                    self._init_sparse(data)
+                else:
+                    self._init_dense(data)
+
+            def _init_sparse(self, data):
+                self.gate_types = data["gate_types"].long()
+                self.gate_inp0 = data["gate_inp0"].long()
+                self.gate_inp1 = data["gate_inp1"].long()
+                self.gate_out = data["gate_out"].long()
+                self.layer_sizes_list = data["layer_sizes"].long().tolist()
+
+                # Precompute per-type masks for vectorized evaluation
+                self.not_mask = self.gate_types == 0
+                self.and_mask = self.gate_types == 1
+                self.or_mask = self.gate_types == 2
+                self.xor_mask = self.gate_types == 3
+
+                # Precompute layer boundaries (cumsum)
+                self._layer_offsets = []
+                offset = 0
+                for s in self.layer_sizes_list:
+                    self._layer_offsets.append((offset, offset + s))
+                    offset += s
+
+            def _init_dense(self, data):
                 layer_meta = data["layer_meta"]
                 self.layers_info = []
                 self.W_pres = nn.ParameterList()
@@ -278,19 +383,66 @@ def _generate_model_code(
 
                 Returns: (batch, num_outputs), values in {{0, 1}}.
                 """
+                if self.is_sparse:
+                    return self._forward_sparse(x)
+                else:
+                    return self._forward_dense(x)
+
+            def _forward_sparse(self, x: torch.Tensor) -> torch.Tensor:
                 x = x.double()
                 batch = x.shape[0]
-
-                # Initialize state with inputs
                 state = torch.zeros(batch, self.total_state_size, dtype=torch.float64, device=x.device)
                 state[:, :self.num_inputs] = x
 
-                # Set constant values
                 if self.has_consts:
                     for ci in range(len(self.const_indices)):
                         state[:, self.const_indices[ci]] = self.const_values[ci]
 
-                # Process each layer
+                # Process layer by layer
+                for start, end in self._layer_offsets:
+                    types = self.gate_types[start:end]
+                    inp0 = self.gate_inp0[start:end]
+                    inp1 = self.gate_inp1[start:end]
+                    out_idx = self.gate_out[start:end]
+
+                    a = state[:, inp0]  # (batch, n_gates_in_layer)
+                    b = state[:, inp1]  # (batch, n_gates_in_layer)
+
+                    # Compute gate outputs vectorized by type
+                    result = torch.zeros(batch, end - start, dtype=torch.float64, device=x.device)
+
+                    not_m = types == 0
+                    and_m = types == 1
+                    or_m = types == 2
+                    xor_m = types == 3
+
+                    if not_m.any():
+                        result[:, not_m] = 1.0 - a[:, not_m]
+                    if and_m.any():
+                        result[:, and_m] = torch.relu(a[:, and_m] + b[:, and_m] - 1.0)
+                    if or_m.any():
+                        ab = a[:, or_m] + b[:, or_m]
+                        result[:, or_m] = ab - torch.relu(ab - 1.0)
+                    if xor_m.any():
+                        ab = a[:, xor_m] + b[:, xor_m]
+                        result[:, xor_m] = ab - 2.0 * torch.relu(ab - 1.0)
+
+                    state[:, out_idx] = result
+
+                out = state[:, self.output_indices]
+                return out.round().long()
+
+            def _forward_dense(self, x: torch.Tensor) -> torch.Tensor:
+                x = x.double()
+                batch = x.shape[0]
+
+                state = torch.zeros(batch, self.total_state_size, dtype=torch.float64, device=x.device)
+                state[:, :self.num_inputs] = x
+
+                if self.has_consts:
+                    for ci in range(len(self.const_indices)):
+                        state[:, self.const_indices[ci]] = self.const_values[ci]
+
                 for i, info in enumerate(self.layers_info):
                     ss = info["state_size"]
                     n_relu = info["n_relu"]
@@ -299,11 +451,9 @@ def _generate_model_code(
 
                     current_state = state[:, :ss]
 
-                    # Pre-activation + ReLU
                     if n_relu > 0:
                         h = current_state @ self.W_pres[i].T + self.b_pres[i]
                         r = torch.relu(h)
-                        # Post-activation
                         combined = torch.cat([current_state, r], dim=1)
                     else:
                         combined = current_state
@@ -311,7 +461,6 @@ def _generate_model_code(
                     gate_out = combined @ self.W_posts[i].T + self.b_posts[i]
                     state[:, gs:gs + n_gates] = gate_out
 
-                # Extract outputs
                 out = state[:, self.output_indices]
                 return out.round().long()
     ''')

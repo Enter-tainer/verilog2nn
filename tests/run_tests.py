@@ -21,11 +21,16 @@ from verilog2nn.verify import verify
 
 VERILOG_DIR = Path(__file__).parent / "verilog"
 
+# Large crypto circuits - skip in T8/T9 bulk scans (tested individually in T12-T14)
+SKIP_BULK = {"md5_full.v", "sha256.v", "aes128.v"}
+
 
 def test_phase2_yosys_json(verbose=False):
     """T8: Verify Yosys JSON parsing."""
     print("\n=== T8: Yosys JSON Parsing ===")
     for vf in sorted(VERILOG_DIR.glob("*.v")):
+        if vf.name in SKIP_BULK:
+            continue
         netlist = synthesize(vf)
         modules = netlist.get("modules", {})
         assert modules, f"No modules in {vf.name}"
@@ -46,8 +51,8 @@ def test_phase3_topo_sort(verbose=False):
     """T9: Verify topological sort and layer assignment."""
     print("\n=== T9: Topological Sort ===")
     for vf in sorted(VERILOG_DIR.glob("*.v")):
-        if vf.name == "md5_round.v":
-            continue  # skip complex circuit for now
+        if vf.name == "md5_round.v" or vf.name in SKIP_BULK:
+            continue  # skip complex circuits
         netlist = synthesize(vf)
         circuit = parse_netlist(netlist)
         layers = topological_sort_layers(circuit)
@@ -194,6 +199,23 @@ def main():
     print("=" * 60)
     results["T11"] = test_verification(
         "T11: MD5 Round", "md5_round.v", exhaustive=False, num_tests=100
+    )
+
+    # Phase 8: Cryptographic algorithms
+    print("\n" + "=" * 60)
+    print("PHASE 8: Cryptographic Algorithms (T12-T14)")
+    print("=" * 60)
+    results["T12"] = test_verification(
+        "T12: Full MD5 (64 steps)", "md5_full.v",
+        exhaustive=False, num_tests=20,
+    )
+    results["T13"] = test_verification(
+        "T13: SHA-256 (64 rounds)", "sha256.v",
+        exhaustive=False, num_tests=10,
+    )
+    results["T14"] = test_verification(
+        "T14: AES-128 (10 rounds)", "aes128.v",
+        exhaustive=False, num_tests=10,
     )
 
     # Summary
