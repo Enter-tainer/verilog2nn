@@ -11,22 +11,26 @@ That got me thinking: if you can hand-build a circuit-as-NN, why not automate it
 ## How it works
 
 ```
-Verilog → Yosys (synthesize to gate-level) → JSON netlist → topological sort → ReLU mapping → PyTorch model
+Verilog → Yosys (synthesize to AND+NOT) → JSON netlist → topological sort → SparseLinear+ReLU MLP → PyTorch model
 ```
 
-1. **Yosys frontend**: reads your `.v` file, flattens hierarchy, maps everything to AND/OR/XOR/NOT via ABC
+1. **Yosys frontend**: reads your `.v` file, flattens hierarchy, maps everything to AND+NOT gates via ABC (`abc -g AND`). AND+NOT is functionally complete — any Boolean function can be expressed with just these two gates.
 2. **Netlist parser**: builds a gate-level DAG from Yosys's JSON output
 3. **Topological sort**: assigns gates to layers — gates in the same layer have no dependencies on each other
-4. **Gate mapping**: each gate becomes a small linear+ReLU block:
+4. **Gate mapping**: AND gates become ReLU neurons, NOT gates are folded into weights:
 
-| Gate | Formula (inputs are 0/1 floats) |
-|------|------|
-| NOT(x) | 1 − x |
-| AND(a,b) | ReLU(a + b − 1) |
-| OR(a,b) | (a + b) − ReLU(a + b − 1) |
-| XOR(a,b) | (a + b) − 2·ReLU(a + b − 1) |
+| Gate | Formula | Neural network equivalent |
+|------|---------|--------------------------|
+| AND(a,b) | ReLU(a + b − 1) | SparseLinear (weights: +1, +1, bias: −1) → ReLU |
+| AND(a, NOT(b)) | ReLU(a − b) | SparseLinear (weights: +1, −1, bias: 0) → ReLU |
+| AND(NOT(a), NOT(b)) | ReLU(−a − b + 1) | SparseLinear (weights: −1, −1, bias: +1) → ReLU |
 
-Gates in the same topological layer get merged into a single wide matrix multiply. Layer-to-layer connections become sparse routing matrices. The whole thing compiles down to a `nn.Module` with integer weights — no training required.
+NOT gates don't produce separate neurons — they're absorbed into the SparseLinear weights of downstream AND gates. This means every layer is just **SparseLinear → ReLU**, a clean MLP architecture.
+
+The generated model consists of:
+- `sparse_linear.py` — `SparseLinear(nn.Module)` using COO format weights
+- `model.py` — `VerilogNN(nn.Module)` stacking SparseLinear + ReLU layers
+- `weights.safetensors` — sparse weights in COO format (indices + values + bias per layer)
 
 ## Quick start
 
@@ -38,9 +42,10 @@ pip install -e .
 verilog2nn tests/verilog/adder4.v -o output/
 
 # this produces:
-#   output/model.py          — nn.Module definition
-#   output/weights.safetensors — model weights
-#   output/inference.py      — standalone inference script
+#   output/sparse_linear.py    — SparseLinear module
+#   output/model.py            — nn.Module definition
+#   output/weights.safetensors — model weights (COO sparse)
+#   output/inference.py        — standalone inference script
 ```
 
 ## Demo: 4-bit adder
@@ -53,7 +58,7 @@ module adder4(input [3:0] a, input [3:0] b, output [4:0] sum);
 endmodule
 ```
 
-verilog2nn synthesizes it into 17 gates across 7 layers, producing a network that maps 8 input bits → 5 output bits. Exhaustive verification over all 256 input combinations confirms exact equivalence:
+verilog2nn synthesizes it down to AND+NOT gates, folds NOTs into weights, and produces a pure SparseLinear → ReLU MLP that maps 8 input bits → 5 output bits. Exhaustive verification over all 256 input combinations confirms exact equivalence:
 
 ```
 $ python tests/run_tests.py
@@ -63,15 +68,28 @@ $ python tests/run_tests.py
   PASSED
 ```
 
-It also handles more serious circuits — the test suite includes an MD5 round function (797 gates), verified against iverilog simulation.
+The test suite also covers crypto-scale circuits: full MD5 (~52K gates), SHA-256 (~136K gates), and AES-128 (~171K gates), all verified bit-exact against iverilog simulation.
 
 ## Tests
 
 ```bash
-python tests/run_tests.py
+python tests/run_tests.py          # full test suite (includes crypto circuits)
+python tests/run_tests.py --quick  # skip crypto tests (faster, used in CI)
 ```
 
-Covers single gates (NOT, AND, OR, XOR), combinational expressions, 4-bit adder, 8-bit comparator, 4-to-1 MUX, multi-module instantiation, and an MD5 round function as a stress test.
+Test coverage:
+- **T1–T3**: Single gates (NOT, AND, OR/XOR via AND+NOT decomposition)
+- **T4**: 4-bit adder
+- **T5**: Combinational expressions
+- **T6**: 8-bit comparator
+- **T7**: 4-to-1 MUX
+- **T8**: Multi-module instantiation
+- **T9**: 8-bit ripple-carry adder
+- **T10**: Generated model structure validation
+- **T11**: MD5 round function (797 gates)
+- **T12**: Full MD5 (~52K gates) — `--quick` skips
+- **T13**: SHA-256 (~136K gates) — `--quick` skips
+- **T14**: AES-128 (~171K gates) — `--quick` skips
 
 ## Acknowledgments
 
