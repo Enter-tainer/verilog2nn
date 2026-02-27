@@ -21,7 +21,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install torch --index-url https://download.pytorch.org/whl/cpu && pip install safetensors packaging
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu && pip install safetensors packaging numpy
 
       - name: Install package
         run: pip install -e .
