@@ -150,6 +150,7 @@ def test_verification(name, vf_name, exhaustive=True, num_tests=100, verbose=Fal
 
 
 def main():
+    quick = "--quick" in sys.argv
     results = {}
 
     # Phase 2: Yosys frontend
@@ -201,22 +202,27 @@ def main():
         "T11: MD5 Round", "md5_round.v", exhaustive=False, num_tests=100
     )
 
-    # Phase 8: Cryptographic algorithms
-    print("\n" + "=" * 60)
-    print("PHASE 8: Cryptographic Algorithms (T12-T14)")
-    print("=" * 60)
-    results["T12"] = test_verification(
-        "T12: Full MD5 (64 steps)", "md5_full.v",
-        exhaustive=False, num_tests=20,
-    )
-    results["T13"] = test_verification(
-        "T13: SHA-256 (64 rounds)", "sha256.v",
-        exhaustive=False, num_tests=10,
-    )
-    results["T14"] = test_verification(
-        "T14: AES-128 (10 rounds)", "aes128.v",
-        exhaustive=False, num_tests=10,
-    )
+    # Phase 8: Cryptographic algorithms (slow, skip with --quick)
+    if not quick:
+        print("\n" + "=" * 60)
+        print("PHASE 8: Cryptographic Algorithms (T12-T14)")
+        print("=" * 60)
+        results["T12"] = test_verification(
+            "T12: Full MD5 (64 steps)", "md5_full.v",
+            exhaustive=False, num_tests=20,
+        )
+        results["T13"] = test_verification(
+            "T13: SHA-256 (64 rounds)", "sha256.v",
+            exhaustive=False, num_tests=10,
+        )
+        results["T14"] = test_verification(
+            "T14: AES-128 (10 rounds)", "aes128.v",
+            exhaustive=False, num_tests=10,
+        )
+    else:
+        print("\n" + "=" * 60)
+        print("PHASE 8: Skipped (--quick mode)")
+        print("=" * 60)
 
     # Summary
     print("\n" + "=" * 60)
