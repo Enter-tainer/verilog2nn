@@ -1,0 +1,10 @@
+__pycache__/
+*.egg-info/
+dist/
+build/
+data/
+.claude/
+plan_metadata.json
+GOAL.md
+plan.md
+*.pyc
