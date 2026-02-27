@@ -10,6 +10,12 @@ from pathlib import Path
 YOSYS_BIN = os.environ.get("YOSYS_BIN", "yosys")
 
 
+def _quote_yosys_arg(value: str | Path) -> str:
+    """Quote a command argument for a Yosys script file."""
+    s = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{s}"'
+
+
 def find_yosys() -> str:
     """Find yosys binary, checking micromamba env if default not found."""
     # Check if default yosys is available
@@ -48,19 +54,27 @@ def synthesize(verilog_path: Path, top: str | None = None) -> dict:
 
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
         json_path = f.name
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".ys", delete=False) as f:
+        script_path = f.name
 
     try:
-        top_cmd = f" -top {top}" if top else ""
-        script = (
-            f"read_verilog {verilog_path}; "
-            f"synth{top_cmd} -flatten; "
-            f"abc -g AND,OR,XOR; "
-            f"clean -purge; "
-            f"write_json {json_path}"
+        script_lines = [f"read_verilog {_quote_yosys_arg(verilog_path)}"]
+        if top:
+            script_lines.append(f"synth -top {top} -flatten")
+        else:
+            script_lines.append("synth -flatten")
+        script_lines.extend(
+            [
+                "abc -g AND,OR,XOR",
+                "clean -purge",
+                f"write_json {_quote_yosys_arg(json_path)}",
+            ]
         )
+        with open(script_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(script_lines))
 
         result = subprocess.run(
-            [yosys, "-p", script],
+            [yosys, script_path],
             capture_output=True,
             text=True,
             timeout=120,
@@ -79,3 +93,5 @@ def synthesize(verilog_path: Path, top: str | None = None) -> dict:
     finally:
         if os.path.exists(json_path):
             os.unlink(json_path)
+        if os.path.exists(script_path):
+            os.unlink(script_path)

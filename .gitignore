@@ -8,3 +8,5 @@ plan_metadata.json
 GOAL.md
 plan.md
 *.pyc
+output
+abc.history
